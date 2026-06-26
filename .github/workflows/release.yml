@@ -1,0 +1,22 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  update-major-tag:
+    name: Update floating major version tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update floating major tag (e.g. v1)
+        run: |
+          MAJOR="$(echo "${{ github.ref_name }}" | cut -d. -f1)"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f "$MAJOR" "${{ github.ref_name }}"
+          git push origin "$MAJOR" --force

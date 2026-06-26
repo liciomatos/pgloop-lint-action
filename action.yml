@@ -1,0 +1,187 @@
+name: pgloop lint
+description: >
+  Detect dangerous PostgreSQL lock patterns in SQL migrations.
+  Emits inline annotations directly on the PR diff — no database
+  connection, no Docker, no Go toolchain required.
+author: Licio Matos
+
+branding:
+  icon: database
+  color: blue
+
+inputs:
+  paths:
+    description: >
+      Space-separated SQL files or directories to lint.
+      Directories are scanned non-recursively for *.sql files
+      in alphabetical order. Mirrors `pgloop lint <path> [...]`.
+    required: false
+    default: migrations/
+
+  version:
+    description: >
+      pgloop release version to download (e.g. v0.1.1).
+      Use 'latest' to resolve the current latest release at
+      workflow runtime via the GitHub API.
+    required: false
+    default: latest
+
+  fail-on:
+    description: >
+      Minimum severity that causes the action to fail (exit code 2).
+      CRITICAL (default): fails only on CRITICAL issues; exit 1 on warnings.
+      WARN: fails on any issue including warnings.
+    required: false
+    default: CRITICAL
+
+  ignore:
+    description: >
+      Comma-separated pattern codes to suppress, e.g. P9,P10.
+      Full list: https://github.com/liciomatos/pgloop#detected-patterns
+    required: false
+    default: ''
+
+  pg-version:
+    description: >
+      Target PostgreSQL major version (e.g. 14). Affects how P1
+      (ADD COLUMN with DEFAULT) is classified.
+      0 = conservative mode that assumes PG10.
+    required: false
+    default: '0'
+
+outputs:
+  exit-code:
+    description: >
+      Raw pgloop exit code: 0 = clean, 1 = warnings only,
+      2 = critical issues found (or warnings with fail-on=WARN).
+    value: ${{ steps.lint.outputs.exit-code }}
+
+  critical:
+    description: Total CRITICAL issues found across all analyzed files.
+    value: ${{ steps.counts.outputs.critical }}
+
+  warn:
+    description: Total WARN issues found across all analyzed files.
+    value: ${{ steps.counts.outputs.warn }}
+
+runs:
+  using: composite
+  steps:
+    # ── 1. Detect OS and architecture ─────────────────────────────────────────
+    - name: Detect platform
+      id: platform
+      shell: bash
+      run: |
+        OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64)        ARCH="amd64" ;;
+          aarch64|arm64) ARCH="arm64" ;;
+          *)
+            echo "::error::Unsupported architecture: ${ARCH}. pgloop supports linux/amd64, linux/arm64, darwin/amd64, darwin/arm64."
+            exit 1
+            ;;
+        esac
+        echo "os=${OS}"     >> "$GITHUB_OUTPUT"
+        echo "arch=${ARCH}" >> "$GITHUB_OUTPUT"
+
+    # ── 2. Resolve 'latest' to a concrete tag ─────────────────────────────────
+    - name: Resolve version
+      id: version
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REQUESTED: ${{ inputs.version }}
+      run: |
+        if [ "$REQUESTED" = "latest" ]; then
+          TAG="$(gh api repos/liciomatos/pgloop/releases/latest --jq '.tag_name')"
+        else
+          TAG="$REQUESTED"
+        fi
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+    # ── 3. Download and extract the pre-built binary ──────────────────────────
+    - name: Download pgloop
+      id: download
+      shell: bash
+      env:
+        OS:   ${{ steps.platform.outputs.os }}
+        ARCH: ${{ steps.platform.outputs.arch }}
+        TAG:  ${{ steps.version.outputs.tag }}
+      run: |
+        BINARY_NAME="pgloop_${OS}_${ARCH}"
+        TARBALL="pgloop_${TAG}_${OS}_${ARCH}.tar.gz"
+        URL="https://github.com/liciomatos/pgloop/releases/download/${TAG}/${TARBALL}"
+        INSTALL_DIR="${RUNNER_TEMP}/pgloop-${TAG}"
+
+        mkdir -p "$INSTALL_DIR"
+        echo "Downloading ${URL}"
+        curl -fsSL "$URL" -o "${INSTALL_DIR}/${TARBALL}"
+        tar -xzf "${INSTALL_DIR}/${TARBALL}" -C "$INSTALL_DIR" "$BINARY_NAME"
+        chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+
+        echo "bin=${INSTALL_DIR}/${BINARY_NAME}" >> "$GITHUB_OUTPUT"
+        "${INSTALL_DIR}/${BINARY_NAME}" --version
+
+    # ── 4. Build optional flag string ─────────────────────────────────────────
+    - name: Build CLI flags
+      id: flags
+      shell: bash
+      env:
+        FAIL_ON:    ${{ inputs.fail-on }}
+        IGNORE:     ${{ inputs.ignore }}
+        PG_VERSION: ${{ inputs.pg-version }}
+      run: |
+        FLAGS="--fail-on ${FAIL_ON}"
+        if [ -n "$IGNORE" ]; then
+          FLAGS="${FLAGS} --ignore ${IGNORE}"
+        fi
+        if [ "${PG_VERSION}" != "0" ]; then
+          FLAGS="${FLAGS} --pg-version ${PG_VERSION}"
+        fi
+        echo "value=${FLAGS}" >> "$GITHUB_OUTPUT"
+
+    # ── 5. Primary run: emit GitHub annotations ───────────────────────────────
+    # set +e so the step itself never fails early; exit code is captured and
+    # propagated in the final step so all subsequent steps always run.
+    - name: Run pgloop lint
+      id: lint
+      shell: bash
+      env:
+        PGLOOP: ${{ steps.download.outputs.bin }}
+        FLAGS:  ${{ steps.flags.outputs.value }}
+        PATHS:  ${{ inputs.paths }}
+      run: |
+        set +e
+        # shellcheck disable=SC2086
+        "$PGLOOP" lint $PATHS --format github $FLAGS
+        echo "exit-code=$?" >> "$GITHUB_OUTPUT"
+
+    # ── 6. Second run: collect numeric counts via JSON ────────────────────────
+    - name: Collect issue counts
+      id: counts
+      shell: bash
+      env:
+        PGLOOP: ${{ steps.download.outputs.bin }}
+        FLAGS:  ${{ steps.flags.outputs.value }}
+        PATHS:  ${{ inputs.paths }}
+      run: |
+        # shellcheck disable=SC2086
+        JSON="$("$PGLOOP" lint $PATHS --format json $FLAGS 2>/dev/null || true)"
+        if [ -z "$JSON" ]; then
+          echo "critical=0" >> "$GITHUB_OUTPUT"
+          echo "warn=0"     >> "$GITHUB_OUTPUT"
+        else
+          # jq -s slurps multiple JSON objects (one per file) into an array
+          CRITICAL=$(printf '%s' "$JSON" | jq -s '[.[].critical] | add // 0')
+          WARN=$(printf '%s'     "$JSON" | jq -s '[.[].warn]     | add // 0')
+          echo "critical=${CRITICAL}" >> "$GITHUB_OUTPUT"
+          echo "warn=${WARN}"         >> "$GITHUB_OUTPUT"
+        fi
+
+    # ── 7. Propagate exit code ─────────────────────────────────────────────────
+    - name: Propagate exit code
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.lint.outputs.exit-code }}
+      run: exit "${EXIT_CODE}"

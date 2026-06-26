@@ -1,0 +1,125 @@
+name: Test action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Runs on both Linux and macOS to validate cross-platform binary download
+  test-clean:
+    name: Clean migration passes (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        with:
+          paths: testdata/migrations/clean.sql
+
+  test-critical-fails:
+    name: Critical issues fail the action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: lint
+        uses: ./
+        continue-on-error: true
+        with:
+          paths: testdata/migrations/critical.sql
+      - name: Assert outcome=failure and exit-code=2
+        run: |
+          if [ "${{ steps.lint.outcome }}" != "failure" ]; then
+            echo "Expected outcome=failure, got: ${{ steps.lint.outcome }}"
+            exit 1
+          fi
+          if [ "${{ steps.lint.outputs.exit-code }}" != "2" ]; then
+            echo "Expected exit-code=2, got: ${{ steps.lint.outputs.exit-code }}"
+            exit 1
+          fi
+
+  test-warn-exits-1:
+    name: Warnings-only does not fail the action (exit-code=1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: lint
+        uses: ./
+        with:
+          paths: testdata/migrations/warn_only.sql
+      - name: Assert exit-code=1 but outcome=success
+        run: |
+          if [ "${{ steps.lint.outputs.exit-code }}" != "1" ]; then
+            echo "Expected exit-code=1, got: ${{ steps.lint.outputs.exit-code }}"
+            exit 1
+          fi
+
+  test-fail-on-warn:
+    name: fail-on=WARN fails on warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: lint
+        uses: ./
+        continue-on-error: true
+        with:
+          paths: testdata/migrations/warn_only.sql
+          fail-on: WARN
+      - name: Assert outcome=failure
+        run: |
+          if [ "${{ steps.lint.outcome }}" != "failure" ]; then
+            echo "Expected failure with fail-on=WARN on a warnings-only file"
+            exit 1
+          fi
+
+  test-ignore-suppresses:
+    name: ignore=P2,P9 suppresses all issues
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        with:
+          paths: testdata/migrations/critical.sql
+          ignore: P2,P9
+
+  test-outputs:
+    name: Outputs report correct counts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: lint
+        uses: ./
+        continue-on-error: true
+        with:
+          paths: testdata/migrations/critical.sql
+          ignore: P9
+      - name: Assert critical >= 1 and warn = 0
+        run: |
+          if [ "${{ steps.lint.outputs.critical }}" -lt 1 ]; then
+            echo "Expected critical >= 1, got: ${{ steps.lint.outputs.critical }}"
+            exit 1
+          fi
+          if [ "${{ steps.lint.outputs.warn }}" -ne 0 ]; then
+            echo "Expected warn=0 after ignore=P9, got: ${{ steps.lint.outputs.warn }}"
+            exit 1
+          fi
+
+  test-pg-version:
+    name: pg-version input is accepted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: lint
+        uses: ./
+        continue-on-error: true
+        with:
+          paths: testdata/migrations/critical.sql
+          pg-version: '14'
+      - name: Assert exit-code output is set
+        run: |
+          if [ -z "${{ steps.lint.outputs.exit-code }}" ]; then
+            echo "exit-code output was not set"
+            exit 1
+          fi
