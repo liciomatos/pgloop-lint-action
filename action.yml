@@ -1,8 +1,6 @@
 name: pgloop lint
 description: >
-  Detect dangerous PostgreSQL lock patterns in SQL migrations.
-  Emits inline annotations directly on the PR diff — no database
-  connection, no Docker, no Go toolchain required.
+  Lint PostgreSQL migrations for dangerous lock patterns. Posts inline PR annotations — no database, Docker, or Go required.
 author: Licio Matos
 
 branding:
